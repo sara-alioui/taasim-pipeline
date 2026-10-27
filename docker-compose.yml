@@ -1,0 +1,229 @@
+services:
+  # ========================
+  # 🚀 KAFKA (KRaft)
+  # ========================
+  kafka:
+    image: confluentinc/cp-kafka:7.6.1
+    container_name: kafka
+    ports:
+      - "9092:9092"
+    environment:
+      CLUSTER_ID: "MkU3OEVBNTcwNTJENDM2Qk"
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,PLAINTEXT_HOST://0.0.0.0:29092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092,PLAINTEXT_HOST://localhost:29092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LOG_DIRS: /tmp/kraft-combined-logs
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      KAFKA_LOG_RETENTION_HOURS: 168
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+    networks:
+      - taasim-net
+
+  # ========================
+  # 🟢 MINIO
+  # ========================
+  minio:
+    image: minio/minio:latest
+    container_name: minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    networks:
+      - taasim-net
+
+  minio-client:
+    image: minio/mc:latest
+    container_name: minio-client
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      until (/usr/bin/mc alias set myminio http://minio:9000 minioadmin minioadmin) do echo '...waiting...' && sleep 1; done ;
+      /usr/bin/mc mb myminio/taasim-raw --ignore-existing;
+      /usr/bin/mc mb myminio/taasim-curated --ignore-existing;
+      /usr/bin/mc mb myminio/taasim-ml --ignore-existing;
+      /usr/bin/mc mb myminio/taasim-checkpoints --ignore-existing;
+      echo 'MinIO buckets created successfully.';
+      tail -f /dev/null
+      "
+    networks:
+      - taasim-net
+
+  # ========================
+  # 🟣 CASSANDRA
+  # ========================
+  cassandra:
+    image: cassandra:4.1
+    container_name: cassandra
+    ports:
+      - "9042:9042"
+    environment:
+      MAX_HEAP_SIZE: 512M
+      HEAP_NEWSIZE: 128M
+      CASSANDRA_CLUSTER_NAME: TaaSimCluster
+      CASSANDRA_DC: DC1
+      CASSANDRA_RACK: RACK1
+      CASSANDRA_ENDPOINT_SNITCH: GossipingPropertyFileSnitch
+    volumes:
+      - cassandra_data:/var/lib/cassandra
+    networks:
+      - taasim-net
+    healthcheck:
+      test: ["CMD-SHELL", "cqlsh -e 'describe cluster' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+
+  # ========================
+  # ⚡ FLINK  ← ✅ CHANGEMENT : image avec Python
+  # ========================
+  flink-jobmanager:
+    build:
+      context: .
+      dockerfile: flink.Dockerfile
+    image: taasim-flink-python:1.17.2
+    container_name: flink-jobmanager
+    ports:
+      - "9091:8081"
+    command: jobmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        # ✅ Checkpointing vers MinIO (Section 6.2)
+        state.backend: filesystem
+        state.checkpoints.dir: s3://taasim-checkpoints/flink/checkpoints
+        execution.checkpointing.interval: 60000
+        execution.checkpointing.mode: EXACTLY_ONCE
+        # ✅ Config S3 / MinIO
+        s3.endpoint: http://minio:9000
+        s3.access-key: minioadmin
+        s3.secret-key: minioadmin
+        s3.path.style.access: true
+    volumes:
+      - ./jobs:/opt/flink/jobs
+    depends_on:
+      - kafka
+      - cassandra
+      - minio
+    networks:
+      - taasim-net
+
+  flink-taskmanager:
+    build:
+      context: .
+      dockerfile: flink.Dockerfile
+    image: taasim-flink-python:1.17.2
+    container_name: flink-taskmanager
+    depends_on:
+      - flink-jobmanager
+    command: taskmanager
+    environment:
+      - |
+        FLINK_PROPERTIES=
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        # ✅ Même config checkpointing
+        state.backend: filesystem
+        state.checkpoints.dir: s3://taasim-checkpoints/flink/checkpoints
+        s3.endpoint: http://minio:9000
+        s3.access-key: minioadmin
+        s3.secret-key: minioadmin
+        s3.path.style.access: true
+    volumes:
+      - ./jobs:/opt/flink/jobs
+    networks:
+      - taasim-net
+
+  # ========================
+  # 🔴 SPARK
+  # ========================
+  spark-master:
+    image: apache/spark:3.5.0-python3
+    container_name: spark-master
+    ports:
+      - "8082:8080"
+      - "7077:7077"
+      - "4040:4040"
+    environment:
+      - SPARK_MODE=master
+      - SPARK_MASTER_HOST=spark-master
+      - SPARK_MASTER_PORT=7077
+      - SPARK_JAVA_OPT=-Dspark.hadoop.fs.s3a.endpoint=http://minio:9000 -Dspark.hadoop.fs.s3a.access.key=minioadmin -Dspark.hadoop.fs.s3a.secret.key=minioadmin -Dspark.hadoop.fs.s3a.path.style.access=true -Dspark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
+    volumes:
+      - ./datasets:/datasets
+    networks:
+      - taasim-net
+    depends_on:
+      - minio
+
+  spark-worker:
+    image: apache/spark:3.5.0-python3
+    container_name: spark-worker
+    depends_on:
+      - spark-master
+    ports:
+      - "8083:8081"
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_JAVA_OPT=-Dspark.hadoop.fs.s3a.endpoint=http://minio:9000 -Dspark.hadoop.fs.s3a.access.key=minioadmin -Dspark.hadoop.fs.s3a.secret.key=minioadmin -Dspark.hadoop.fs.s3a.path.style.access=true -Dspark.hadoop.fs.s3a.impl=org.apache.hadoop.fs.s3a.S3AFileSystem
+    volumes:
+      - ./datasets:/datasets
+    networks:
+      - taasim-net
+
+  # ========================
+  # 📊 JUPYTER
+  # ========================
+  jupyter:
+    image: jupyter/pyspark-notebook:latest
+    container_name: jupyter
+    ports:
+      - "8888:8888"
+    environment:
+      - JUPYTER_ENABLE_LAB=yes
+      - SPARK_MASTER=spark://spark-master:7077
+      - PYSPARK_PYTHON=python3
+    volumes:
+      - ./notebooks:/home/jovyan/work
+      - ./datasets:/home/jovyan/datasets
+    networks:
+      - taasim-net
+    command: start-notebook.sh --NotebookApp.token='' --NotebookApp.password=''
+
+  # ========================
+  # 📊 GRAFANA
+  # ========================
+  grafana:
+    image: grafana/grafana:10.4.2
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - cassandra
+    volumes:
+      - grafana_data:/var/lib/grafana
+    networks:
+      - taasim-net
+
+networks:
+  taasim-net:
+    driver: bridge
+
+volumes:
+  minio_data:
+  cassandra_data:
+  grafana_data:

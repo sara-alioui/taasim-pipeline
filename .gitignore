@@ -1,0 +1,23 @@
+﻿# Données lourdes
+datasets/
+*.csv
+*.zip
+*.pbix
+
+# Checkpoints Jupyter
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Secrets / environnement
+.env
+
+# PDF de cours
+*.pdf
+
+notebooks/porto-trips-mapped/
+*.parquet
